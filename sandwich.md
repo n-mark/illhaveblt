@@ -52,6 +52,17 @@
 2. [C2 - Container Level](#2-container-level)
 
 
+### Описание сервисов и контрактов взаимодействия
+1. [Order API](#1-order-api)
+2. [Delivery API](#2-delivery-api)
+3. [Restaurant API](#3-restaurant-api)
+4. [Management API](#4-management-api)
+5. [Analytics API](#5-analytics-api)
+6. [User API](#6-user-api)
+7. [Payment API](#7-payment-api)
+8. [Notification API](#8-notification-api)
+9. [Message API](#9-message-api)
+
 ---
 ## Клиент
 ### 1. Первый визит и определение местоположения
@@ -1086,3 +1097,431 @@
 
 ### 2. Container Level
 ![img](/C2-ContainerLevel.svg)
+
+
+
+## Описание сервисов и контрактов взаимодействия
+
+## 1. Order API
+**Service Name:** Order API
+<br>
+**Description:** Управление жизненным циклом заказа: создание, изменение, отмена, отслеживание статусов.
+
+### Consumer Tasks
+- Клиент создаёт/меняет/отменяет заказ.
+- Работник ресторана обновляет статус заказа (начало/завершение готовки).
+
+### Dependencies
+**Service Dependencies** (синхронные REST)
+- Payment API: `POST /internal/authorize`, `POST /internal/capture`, `POST /internal/refund`
+- Delivery API: запрос доставки, оповещение о готовности - асинхронно, отмена - `POST /internal/cancelDelivery`
+- Notification API: асинхронно
+
+**Event Subscriptions** (Kafka)
+- `delivery.events`: `CourierAssigned`, `CourierPickedUp`, `CourierDelivered`, `DeliveryFailed`, `CustomerNotReachable`
+
+**Logic/Rules**
+- Нельзя отменить заказ после статуса `Cooking`.
+- При самовывозе не вызывать Delivery API.
+
+### Interface
+**Queries** (REST GET)
+- `GET /api/v1/orders/{orderId}` – детали заказа
+- `GET /api/v1/orders/{orderId}/status` – текущий статус
+- `GET /api/v1/orders?userId={userId}&limit=10&offset=0` – список заказов пользователя
+- `GET /api/v1/orders/{orderId}/eta` – расчётное время доставки
+
+**Commands** (REST POST/PUT/DELETE)
+
+- `POST /api/v1/orders` – создать заказ
+  *Body:* `{ userId, restaurantId, items, pickupType, address, paymentMethodId }`
+  *Response:* `{ orderId, status, total, estimatedPickupTime }`
+
+- `PUT /api/v1/orders/{orderId}` – изменить заказ
+  *Body:* `{ items: [...] }`
+
+- `POST /api/v1/orders/{orderId}` – отменить заказ
+  *Body:* `{reason, comment}`
+
+- `POST /api/v1/orders/{orderId}/promo` – применить промокод
+  *Body:* `{ code }` → возвращает скидку
+
+- `PUT /api/v1/orders/{orderId}/status`
+  *Body:* `{ status }`
+
+
+
+**Events Published** (Kafka)
+- `OrderCreated`, `OrderRevised`, `OrderCancelled`, `OrderCookingStarted`, `OrderReadyForPickup`, `OrderPickedUp`, `OrderDelivered`, `OrderFailed`
+
+---
+
+## 2. Delivery API
+**Service Name:** Delivery API
+<br>
+**Description:** Управление курьерами, назначение заказов, отслеживание геопозиции в реальном времени, обработка проблем доставки.
+
+### Consumer Tasks
+- Курьер получает заказы на доставку, принимает/отклоняет заказ, отмечает получение и доставку.
+
+### Dependencies
+**Service Dependencies**
+- Картографический сервис (REST: `GET /routes`, `GET /distance`)
+
+**Event Subscriptions** (Kafka)
+- `order.events`: `OrderNeedsDelivery`,`OrderReadyForPickup`
+
+**Logic/Rules**
+- Курьер может принять не более 3 активных заказов одновременно.
+- При отклонении заказ переназначается следующему ближайшему курьеру.
+- Если клиент не вышел на связь 10 минут – доставка переводится в статус DeliveryFailed.
+
+### Interface
+**Queries** (REST GET)
+- `GET /api/v1/deliveries/{orderId}/courier-location` – текущая геопозиция курьера
+  *Response:* `{ lat, lon, lastUpdate }`
+- `GET /api/v1/deliveries/{orderId}/eta` – расчётное время прибытия
+- `GET /api/v1/couriers/available?lat={lat}&lon={lon}&radius={radius}` – список свободных курьеров
+- `GET /api/v1/couriers/{courierId}/history?from=2025-01-01&to=2025-01-31` – история доставок курьера
+
+**Commands** (REST POST/PUT)
+
+- `POST /api/v1/deliveries/{orderId}/accept` – курьер принимает заказ
+  *Body:* `{ courierId }`
+
+- `POST /api/v1/deliveries/{orderId}/reject` – отклонить
+  *Body:* `{ courierId, reason }`
+
+- `PUT /api/v1/deliveries/{orderId}/pickup` – курьер забрал заказ
+  *Body:* `{ courierId }`
+
+- `PUT /api/v1/deliveries/{orderId}/deliver` – доставлен
+  *Body:* `{ courierId, paymentReceived (bool) }`
+
+- `POST /api/v1/deliveries/{orderId}/problem` – сообщить о проблеме
+  *Body:* `{ problemType, description }`
+
+**Events Published** (Kafka)
+- `CourierAssigned`, `CourierPickedUp`, `CourierDelivered`, `DeliveryFailed`, `CustomerNotReachable`
+
+---
+
+## 3. Restaurant API
+**Service Name:** Restaurant API
+
+**Description:** Просмотр доступных ресторанов, меню (глобальное/региональное), акции
+
+### Consumer Tasks
+- Просмотр доступных ресторанов / меню / позиций
+
+### Interface
+**Queries** (REST GET)
+- `GET /api/v1/menu` – меню с акциями
+    *Params:* `regionId`, `restaurantId`
+  *Response:* `{ categories: [...], items: [...], promotions: [] }`
+- `GET /api/v1/promotions?lat={lat}&lng={lng}` – акции для текущего местоположения
+- `GET /api/v1/restaurants?region={regionId}` – список ресторанов
+
+**Events Published** (Kafka)
+- NO
+
+---
+
+## 4. Management API
+**Service Name:** Management API
+
+**Description:** Управление ресторанами, меню (глобальным/региональным/локальным), акциями, сотрудниками.
+
+### Consumer Tasks
+- Региональный менеджер добавляет ресторан, назначает менеджеров.
+- Локальный менеджер управляет доступностью позиций, акциями, часами работы.
+
+### Dependencies
+- Restaurant API: *cоздать ресторан:* `POST /internal/restaurant`, *настроить ресторан:* `PUT /internal/restaurant`, *создать меню:* `POST /internal/menu`,  *изменить меню:* `PUT /internal/menu/{id}`, *создать акцию:* `POST /internal/promo`, *изменить акцию:* `PUT /internal/promo/{id}`
+- User API: *добавить сотрудника:* `POST /internal/user`, *изменить запись сотрудника (в т.ч. деактивировать):* `PUT /internal/user/{id}`, *изменить роль сотрудника:* `PUT /internal/user/{id}/role`, *закрепить ресторан(ы) за сотрудником* 'POST /internal/user/{id}/restaurants'
+- Notification API *оповестить зарегистрированных пользователей региона о новой акции / промо:* `асинхронно`
+
+**Logic/Rules**
+- Локальный менеджер может только включать/отключать доступность позиции (не может менять цену/состав).
+- Региональный менеджер управляет региональным меню и акциями.
+- Глобальный менеджер создаёт глобальные позиции и акции, которые нельзя отключить локально.
+
+### Interface
+**Commands** (REST POST/PUT/DELETE)
+
+- `POST /api/v1/restaurants` – создать ресторан
+  *Body:* `{ name, address, regionId, franchiseOwnerId }`
+
+- `PUT /api/v1/restaurants/{restaurantId}/status` – изменить статус (активен/закрыт)
+  *Body:* `{ status }`
+
+- `POST /api/v1/restaurants/{restaurantId}/menu/items` – добавить позицию в меню
+  *Body:* `{ name, price, ingredients, options }`
+
+- `PUT /api/v1/menu/items/{itemId}/availability` – включить/отключить доступность
+  *Body:* `{ available: true/false }`
+
+- `POST /api/v1/promotions` – создать акцию
+  *Body:* `{ name, type, discount, startDate, endDate, applicableItems, applicableRestaurants }`
+
+- `POST /api/v1/managers/local` – назначить локального менеджера
+  *Body:* `{ userId, restaurantIds[] }`
+
+**Events Published** (Kafka)
+- `NewPromoCreated`, `PromoUpdated`
+
+---
+
+## 5. Analytics API
+**Service Name:** Analytics API
+<br>
+**Description:** Агрегирует данные из событий всех сервисов для построения отчётов для менеджеров (локальных, региональных, глобальных) и владельцев франшизы.
+
+### Consumer Tasks
+- Локальный менеджер смотрит выручку и загрузку своих ресторанов.
+- Региональный менеджер сравнивает рестораны в регионе.
+- Владелец франшизы видит роялти и финансы.
+
+### Dependencies
+**Service Dependencies**
+- Нет внешних вызовов
+
+**Event Subscriptions** (Kafka)
+- `order.events`: для статистики по заказам
+- `delivery.events`: для статистики по доставке
+- `restaurant.events`: для аналитики по ресторанам
+- `payment.events`: для финансовых отчётов
+
+**Logic/Rules**
+- Выручка считается по сумме оплаченных заказов (статус Delivered).
+- Роялти для владельца франшизы = % от выручки его ресторанов.
+- Эффективность акции = (прирост выручки) / (стоимость акции).
+
+### Interface
+**Queries** (REST GET)
+- `GET /api/v1/analytics/revenue?restaurantId={id}&period=week` – выручка ресторана
+*Response:* `{ total, byDay: [...], comparisonToPreviousPeriod }`
+- `GET /api/v1/analytics/top-items?regionId={id}&limit=10` – топ позиций в регионе
+- `GET /api/v1/analytics/promotion/{promotionId}/roi` – окупаемость акции
+- `GET /api/v1/analytics/kitchen-efficiency?restaurantId={id}` – среднее время готовки, просрочки
+- `GET /api/v1/analytics/royalties?franchiseOwnerId={id}&year=2025` – отчёт по роялти
+- `GET /api/v1/analytics/dashboard/regional?regionId={id}` – дашборд регионального менеджера
+
+**Commands** (REST POST)
+- Нет команд, только чтение.
+
+**Events Published**
+- Нет.
+
+
+----
+## 6. User API
+**Service Name:** User API
+<br>
+**Description:** Регистрация и авторизация через телефон (входящий звонок), управление профилем, адресами доставки, ролями пользователей.
+
+### Consumer Tasks
+- Клиент регистрируется, входит, добавляет адреса.
+- API Gateway проверяет права доступа (через REST-запрос).
+- BFF получает профиль и адреса.
+
+### Dependencies
+**Service Dependencies**
+- SMS/звонок-провайдер (REST: `POST /call/send-verification`)
+
+**Event Subscriptions**
+- Нет
+
+**Logic/Rules**
+- При регистрации номер подтверждается звонком.
+- Один номер телефона = один аккаунт.
+- Роли сотрудников назначаются только менеджерами (через Restaurant API).
+
+### Interface
+**Queries** (REST GET)
+- `GET /api/v1/users/{userId}` – профиль пользователя
+- `GET /api/v1/users/by-phone?phone={phone}` – найти пользователя по номеру
+- `GET /api/v1/users/{userId}/address` – дефолтный адрес доставки
+- `GET /api/v1/auth/check-permission?userId={userId}&resource={resource}&action={action}` – проверка прав (для API Gateway)
+**Commands** (REST POST/PUT)
+- `POST /api/v1/auth/register` – начать регистрацию
+*Body:* `{ phone, name }` → инициирует звонок, возвращает `verificationId`
+- `POST /api/v1/auth/verify` – подтвердить код (последние цифры звонка)
+*Body:* `{ verificationId, code }` → возвращает JWT токен
+- `POST /api/v1/auth/login` – вход по телефону
+*Body:* `{ phone }` → инициирует звонок, затем `verify`
+- `POST /api/v1/users/{userId}/addresses` – добавить адрес
+*Body:* `{ street, city, apartment, entrance, lat, lng }`
+- `PUT /api/v1/users/{userId}` – обновить профиль
+*Body:* `{ name, email }`
+- `POST /api/v1/users/{userId}/roles` – назначить роль (только для менеджеров)
+*Body:* `{ role, scope }`
+**Events Published** (Kafka)
+- `UserRegistered`, `UserAddressChanged`, `UserRoleAssigned`
+
+---
+
+## 7. Payment API
+**Service Name:** Payment API
+<br>
+**Description:** Адаптер для внешней платёжной системы (банк, карты, терминалы). Обрабатывает авторизацию, списание, возвраты.
+
+### Consumer Tasks
+- Order API запрашивает авторизацию и списание.
+- Клиент (через BFF) оплачивает заказ онлайн.
+- Курьер фиксирует оплату наличными.
+
+### Dependencies
+**Service Dependencies**
+- Внешняя платёжная система – REST API
+
+**Event Subscriptions** (Kafka)
+- `order.events`: `OrderCreated` → авторизация
+- `order.events`: `OrderCancelled` → возврат
+
+**Logic/Rules**
+- Для заказов с оплатой при получении – авторизация не требуется, только фиксация факта оплаты курьером.
+- Возврат возможен только если заказ отменён до начала готовки.
+
+### Interface
+**Queries** (REST GET)
+- `GET /api/v1/payments/status?orderId={orderId}` – статус платежа по заказу
+- `GET /api/v1/payments/history?userId={userId}` – история транзакций пользователя
+**Commands** (REST POST)
+- `POST /api/v1/payments/authorize` – авторизовать платёж
+*Body:* `{ orderId, amount, paymentMethodId }`
+- `POST /api/v1/payments/capture` – списать средства
+*Body:* `{ orderId, amount }`
+- `POST /api/v1/payments/refund` – возврат
+*Body:* `{ orderId, amount, reason }`
+- `POST /api/v1/payments/cash` – зафиксировать оплату наличными (для курьера)
+*Body:* `{ orderId, amount, receivedByCourierId }`
+
+**Events Published** (Kafka)
+- `PaymentAuthorized`, `PaymentCaptured`, `PaymentFailed`, `PaymentRefunded`
+
+---
+
+## 8. Notification API
+**Service Name:** Notification API
+<br>
+**Description:** Отправляет push-уведомления, SMS, email пользователям, курьерам, работникам ресторана. Потребляет события из всех сервисов.
+
+### Consumer Tasks
+- Клиент получает уведомление о смене статуса заказа.
+- Курьер получает push о новом заказе.
+- Ресторан получает уведомление о новом заказе (через интерфейс, не через API).
+
+### Dependencies
+**Service Dependencies**
+- Messaging
+- SMS-провайдер
+- Email-провайдер
+
+**Event Subscriptions** (Kafka)
+- Все `*.events` топики: `order.events`, `delivery.events`, `restaurant.events`, `user.events`, `payment.events`
+
+**Logic/Rules**
+- Для каждого события определён шаблон сообщения (например, `OrderCreated` → "Ваш заказ №{id} принят").
+- Приоритет: push → SMS → email (если push не доставлен).
+- Не отправлять уведомления для тестовых заказов.
+
+### Interface
+**Queries** (REST GET)
+- `GET /api/v1/notifications/{notificationId}/status` – статус доставки уведомления
+- `GET /api/v1/notifications?userId={userId}&limit=20` – список уведомлений пользователя
+
+**Commands** (REST POST)
+- Нет синхронных команд – все уведомления инициируются событиями.
+
+**Events Published**
+- Нет, Notification API только потребляет.
+---
+
+## 9. Message API
+**Service Name:** Message API
+<br>
+
+**Description:** Обмен сообщениями в реальном времени между клиентом, курьером, персоналом ресторана и поддержкой. WebSocket для мгновенной доставки, хранение истории переписки. Поддерживает заказные чаты и внутренние каналы ресторана.
+
+### Consumer Tasks
+- Клиент пишет курьеру во время доставки (например, уточнить адрес).
+- Курьер отвечает клиенту или запрашивает помощь.
+- Поддержка ресторана переписывается с клиентом по вопросам заказа.
+- Управляющий ресторана отправляет объявления и задачи сотрудникам (повара, кассиры).
+- Сотрудники ресторана общаются в общем канале смены.
+### Dependencies
+**Service Dependencies**
+- Order API: `GET /internal/orders/{orderId}/participants` — получить участников заказа (клиент, курьер, ресторан)
+- User API: `GET /internal/users/{userId}` — имя и аватар для отображения
+- Restaurant API: `GET /internal/restaurants/{restaurantId}/staff` — список сотрудников ресторана с ролями
+
+**Event Subscriptions** (Kafka)
+- `order.events`: `OrderCreated` → создать комнату чата заказа
+- `order.events`: `OrderDelivered`, `OrderCancelled` → закрыть комнату чата заказа (архивация)
+- `delivery.events`: `CourierAssigned` → добавить курьера в комнату заказа
+- `restaurant.events`: `StaffShiftStarted` → добавить сотрудника в канал смены
+- `restaurant.events`: `StaffShiftEnded` → убрать сотрудника из канала смены
+
+
+**Logic/Rules**
+- **Заказные чаты (type=order):**
+  - Комната создаётся автоматически при создании заказа.
+  - Участники: клиент, курьер (после назначения), поддержка ресторана.
+  - После доставки/отмены комната закрывается, новые сообщения невозможны.
+  - Только участники заказа могут читать и писать.
+- **Внутренние каналы (type=channel):**
+  - Типы каналов:
+    - `shift` — автоматический канал текущей смены ресторана (все сотрудники на смене).
+    - `announce` — канал объявлений (только управляющий пишет, сотрудники читают).
+    - `direct` — личная переписка между двумя сотрудниками (управляющий ↔ сотрудник, сотрудник ↔ сотрудник).
+  - Канал `announce` создаётся один на ресторан, управляющий — единственный отправитель.
+  - Канал `shift` создаётся автоматически, участники добавляются/удаляются по событиям смены.
+  - Канал `direct` создаётся по запросу любого сотрудника ресторана.
+  - Управляющий может писать во все каналы своего ресторана.
+  - Сотрудник может писать только в `shift` и `direct`.
+- **Общие правила:**
+  - Сообщения сохраняются 30 дней после закрытия комнаты (order) или 90 дней (channel), затем удаляются.
+  - Максимальная длина сообщения: 1000 символов.
+  - Медиафайлы (фото) загружаются через Storage API, в сообщении передаётся URL.
+  - Только участники заказа/канала могут читать и писать.
+
+### Interface
+**Queries** (REST GET)
+- `GET /api/v1/chats/{roomId}/messages?limit=50&before={messageId}` — история сообщений (пагинация назад)
+- `GET /api/v1/chats/by-order?orderId={orderId}` — получить комнату по заказу
+- `GET /api/v1/chats?userId={userId}&type={order|channel}&limit=20` — список комнат пользователя с последним сообщением
+- `GET /api/v1/chats/{roomId}/participants` — участники комнаты и их онлайн-статус
+- `GET /api/v1/chats/channels?restaurantId={restaurantId}` — список внутренних каналов ресторана
+**Commands** (REST POST / WebSocket)
+- `POST /api/v1/chats/{roomId}/messages` — отправить сообщение (REST, fallback)
+*Body:* `{ senderId, text, mediaUrl? }`
+*Response:* `{ messageId, createdAt }`
+- `POST /api/v1/chats/channels` — создать внутренний канал
+*Body:* `{ type, restaurantId, name, participantIds? }`
+*Response:* `{ roomId, type }`
+- `POST /api/v1/chats/channels/direct` — начать личную переписку
+*Body:* `{ restaurantId, fromUserId, toUserId }`
+*Response:* `{ roomId }`
+- `POST /api/v1/chats/channels/{roomId}/announce` — отправить объявление (только управляющий)
+*Body:* `{ senderId, text, mediaUrl? }`
+*Response:* `{ messageId, deliveryCount }`
+- `PUT /api/v1/chats/{roomId}/read` — отметить сообщения прочитанными
+*Body:* `{ userId, lastReadMessageId }`
+- `POST /api/v1/chats/{roomId}/participants` — добавить участника в канал
+*Body:* `{ userId }` (только для каналов типа channel, только админ)
+- `DELETE /api/v1/chats/{roomId}/participants/{userId}` — удалить участника
+- WebSocket events (клиент → сервер):
+  - `message.send` `{ roomId, text, mediaUrl? }` — отправить сообщение
+  - `message.typing` `{ roomId, isTyping }` — индикатор набора текста
+  - `message.read` `{ roomId, lastReadMessageId }` — подтверждение прочтения
+- WebSocket events (сервер → клиент):
+  - `message.new` `{ messageId, roomId, senderId, text, mediaUrl, createdAt }` — новое сообщение
+  - `message.typing` `{ roomId, userId, isTyping }` — кто-то печатает
+  - `message.read` `{ roomId, userId, lastReadMessageId }` — кто-то прочитал
+  - `channel.joined` `{ roomId, userId }` — сотрудник добавлен в канал
+  - `channel.removed` `{ roomId, userId }` — сотрудник удалён из канала
+  - `chat.closed` `{ roomId, reason }` — комната закрыта
+
+**Events Published** (Kafka)
+- `MessageSent`, `ChatRoomCreated`, `ChatRoomClosed`, `AnnouncementSent`, `ChannelCreated`
